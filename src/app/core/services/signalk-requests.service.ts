@@ -27,6 +27,9 @@ export interface skRequest {
   statusCodeDescription?: string;
   widgetUUID?: string;
   message?: string;
+  path?: string;
+  value?: unknown;
+  createdAt?: number;
 }
 
 @Injectable({
@@ -165,6 +168,9 @@ export class SignalkRequestsService {
       state: null,
       statusCode: null,
       widgetUUID: widgetUUID,
+      path: path,
+      value: value,
+      createdAt: Date.now(),
     };
 
     this.requests.push(request); // save to private array pending response with widgetUUID so we can filter response from subscriber
@@ -184,8 +190,10 @@ export class SignalkRequestsService {
       this.requests[index].message = delta.message;
 
       const currentStatusCode = deltaStatusCodes[delta.statusCode];
+      const requestContext = this.formatRequestContext(this.requests[index]);
+      const requestMessage = delta.message || currentStatusCode || 'No additional server message';
 
-      if ((typeof currentStatusCode != 'undefined') && (this.requests[index].statusCode == 200 || this.requests[index].statusCode == 202 || this.requests[index].statusCode == 400 || this.requests[index].statusCode == 401 || this.requests[index].statusCode == 403 || this.requests[index].statusCode == 405)) {
+      if ((typeof currentStatusCode != 'undefined') && (this.requests[index].statusCode == 200 || this.requests[index].statusCode == 202 || this.requests[index].statusCode == 400 || this.requests[index].statusCode == 401 || this.requests[index].statusCode == 403 || this.requests[index].statusCode == 405 || this.requests[index].statusCode == 504)) {
         this.requests[index].statusCodeDescription = currentStatusCode;
 
         if (this.requests[index].statusCode == 202) {
@@ -206,6 +214,12 @@ export class SignalkRequestsService {
           console.error("[Request Service] Status Code: " + this.requests[index].statusCode + " - " + this.requests[index].message);
         }
 
+        if (this.requests[index].statusCode == 504) {
+          const timeoutMessage = `Request timed out (${this.requests[index].statusCode}): ${currentStatusCode}${requestContext} - ${requestMessage}`;
+          this.toast.show(timeoutMessage, 0, false, 'error');
+          console.error(`[Request Service] ${timeoutMessage}`);
+        }
+
         if ((delta.accessRequest !== undefined) && (delta.accessRequest.token !== undefined)) {
           this.toast.show(delta.accessRequest.permission + ": Device Access Token received from server.", 5000, false, 'success');
           console.log(`[Request Service] ${delta.accessRequest.permission}: Device Access Token received`);
@@ -221,8 +235,9 @@ export class SignalkRequestsService {
         }
 
       } else {
-        this.toast.show("Unknown Request Status Code received: " + this.requests[index].statusCode + " - " + deltaStatusCodes[this.requests[index].statusCode] + " - " + this.requests[index].message, 0, false, 'error');
-        console.error("[Request Service] Unknown Request Status Code received: " + this.requests[index].statusCode + " - " + deltaStatusCodes[this.requests[index].statusCode] + " - " + this.requests[index].message);
+        const unknownMessage = `Unknown Request Status Code received: ${this.requests[index].statusCode} - ${deltaStatusCodes[this.requests[index].statusCode]}${requestContext} - ${requestMessage}`;
+        this.toast.show(unknownMessage, 0, false, 'error');
+        console.error(`[Request Service] ${unknownMessage}`);
       }
       try {
         this.requestStatus$.next(this.requests[index]);    // dispatched results
@@ -247,5 +262,19 @@ export class SignalkRequestsService {
    */
   public subscribeRequest(): Observable<skRequest> {
     return this.requestStatus$.asObservable();
+  }
+
+  private formatRequestContext(request: skRequest): string {
+    const contextParts: string[] = [];
+    if (request.path) {
+      contextParts.push(`path=${request.path}`);
+    }
+    if (request.widgetUUID) {
+      contextParts.push(`origin=${request.widgetUUID}`);
+    }
+    if (typeof request.value !== 'undefined') {
+      contextParts.push(`value=${JSON.stringify(request.value)}`);
+    }
+    return contextParts.length ? ` [${contextParts.join(', ')}]` : '';
   }
 }
