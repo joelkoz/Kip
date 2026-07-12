@@ -149,6 +149,7 @@
   },
   "dependencies": {
     "@signalk/server-api": "^2.22.0",
+    "signalk-plotterext-bus": "^0.10.0",
     "sk-ais-status-plugin": "^1.0.0"
   }
 }

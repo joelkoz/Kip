@@ -8,15 +8,7 @@ import { WidgetRuntimeDirective } from '../../core/directives/widget-runtime.dir
 import { IWidgetSvcConfig } from '../../core/interfaces/widgets-interface';
 import { AppService, ITheme } from '../../core/services/app-service';
 import { toSignal } from '@angular/core/rxjs-interop';
-
-interface FreeboardCommandMessage {
-  settings?: {
-    autoNightMode?: boolean;
-  };
-  commands?: {
-    nightModeEnable?: boolean;
-  };
-};
+import { connectExtension, ExtensionClient, windowPort } from 'signalk-plotterext-bus/extension';
 
 
 @Component({
@@ -44,7 +36,10 @@ export class WidgetFreeboardskComponent implements AfterViewInit, OnDestroy {
   private readonly authToken = toSignal<IAuthorizationToken | null>(this.auth.authToken$, { initialValue: null });
 
   private viewReady = false;
-  private iframeLoaded = false;
+  // Plotter Extensions bus client: KIP drives the embedded Freeboard as a
+  // caller (the "embedding host") over the negotiated bus, in place of the
+  // legacy night-mode postMessage bridge.
+  private busClient: ExtensionClient | null = null;
   public widgetUrl: string | null = null;
   protected widgetUrlSafe = '';
   public static readonly DEFAULT_CONFIG: IWidgetSvcConfig = {};
@@ -70,12 +65,7 @@ export class WidgetFreeboardskComponent implements AfterViewInit, OnDestroy {
     effect(() => {
       const nightModeEnabled = this.app.isNightMode();
 
-      untracked(() => {
-        if (!this.iframeLoaded || !this.viewReady) return;
-        if(this.appSettings.getRedNightMode()) {
-          this.sendMessage({ commands: { nightModeEnable: nightModeEnabled } });
-        }
-      });
+      untracked(() => this.applyNightMode(nightModeEnabled));
     });
   }
 
@@ -85,8 +75,7 @@ export class WidgetFreeboardskComponent implements AfterViewInit, OnDestroy {
     // Ensure we mark the iframe loaded AND inject gestures.
     try {
       this.iframe().nativeElement.onload = () => {
-        this.iframeLoaded = true;
-        this.sendMessage({ settings: { autoNightMode: false } });
+        this.connectBus();
         this.injectSwipeScript();
       };
     } catch {
@@ -94,12 +83,57 @@ export class WidgetFreeboardskComponent implements AfterViewInit, OnDestroy {
     }
   }
 
-  private sendMessage(msg: FreeboardCommandMessage, targetOrigin = '*'): void {
-    const window = this.iframe()?.nativeElement?.contentWindow;
-    if (!window) return;
-    if (!this.iframeLoaded) return;
+  // Connect to the embedded Freeboard over the Plotter Extensions bus as the
+  // caller. KIP is the parent, so the port targets the child iframe's window;
+  // the origin is pinned to Freeboard's own origin (a cross-origin embedder is
+  // refused by the host). Reconnects cleanly if the iframe reloads.
+  private async connectBus(): Promise<void> {
+    this.busClient?.close();
+    this.busClient = null;
 
-    window.postMessage(msg, targetOrigin);
+    const target = this.iframe()?.nativeElement?.contentWindow;
+    if (!target) return;
+
+    const origin = this.getExpectedIframeOrigin();
+    try {
+      const client = await connectExtension({
+        port: windowPort(target, { origin: origin ?? '*' }),
+        id: 'kip'
+      });
+      // Guard against a stale connection if the iframe reloaded mid-handshake.
+      if (this.iframe()?.nativeElement?.contentWindow !== target) {
+        client.close();
+        return;
+      }
+      this.busClient = client;
+      // Match the legacy bridge: unconditionally take manual control of night
+      // mode on load (do not follow the server), regardless of red-night-mode.
+      // The current enabled state is not pushed here — as before, it follows on
+      // the next isNightMode() change.
+      this.takeControlOfNightMode();
+    } catch (err) {
+      console.warn('[FSK Widget] Plotter Extensions bus handshake failed:', err);
+    }
+  }
+
+  // Take manual control of Freeboard's night mode (do not follow the server) —
+  // the bus equivalent of the legacy `settings.autoNightMode = false`, sent once
+  // on connect regardless of the red-night-mode setting.
+  private takeControlOfNightMode(): void {
+    if (!this.busClient?.hasCapability('nightMode')) return;
+    this.busClient.nightMode
+      .set({ auto: false })
+      .catch((err) => console.warn('[FSK Widget] nightMode.set failed:', err));
+  }
+
+  // Drive Freeboard's night mode over the bus, honouring KIP's red-night-mode
+  // setting — the bus equivalent of the legacy `commands.nightModeEnable`.
+  private applyNightMode(enabled: boolean): void {
+    if (!this.busClient?.hasCapability('nightMode')) return;
+    if (!this.appSettings.getRedNightMode()) return;
+    this.busClient.nightMode
+      .set({ enabled })
+      .catch((err) => console.warn('[FSK Widget] nightMode.set failed:', err));
   }
 
   private injectSwipeScript() {
@@ -175,6 +209,8 @@ export class WidgetFreeboardskComponent implements AfterViewInit, OnDestroy {
 
   ngOnDestroy(): void {
     window.removeEventListener('message', this.handleIframeGesture);
+    this.busClient?.close();
+    this.busClient = null;
     if (this.iframe) {
       try { this.iframe().nativeElement.onload = null; } catch (err) { void err; }
       try {
