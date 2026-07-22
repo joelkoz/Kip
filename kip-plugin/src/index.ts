@@ -1,10 +1,23 @@
-import { ActionResult, Path, Plugin, ServerAPI, SKVersion } from '@signalk/server-api'
+import { ActionResult, Path, Plugin, ServerAPI, SKVersion, ResourceProviderRegistry } from '@signalk/server-api'
 import { Request, Response, NextFunction } from 'express'
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import * as openapi from './openApi.json';
 import { HistorySeriesService, IHistoryQueryParams, IHistoryValuesResponse, ISeriesDefinition, THistoryMethod, isKipConcreteSeriesDefinition, isKipElectricalTemplateSeriesDefinition, isKipSeriesEnabled, isKipTemplateSeriesDefinition } from './history-series.service';
 import { SqliteHistoryStorageService } from './sqlite-history-storage.service';
 import { HistoryApi, ValuesRequest, ValuesResponse, PathsRequest, PathsResponse, ContextsRequest, ContextsResponse } from '@signalk/server-api/history';
 import { IElectricalTrackedDeviceRef, TElectricalFamilyKey } from './kip-series-contract';
+import {
+  SymbolProviderConfig,
+  resolveSymbolProviderConfig,
+  symbolProviderEnabled,
+  buildSymbolCollection,
+  createSymbolProviderMethods,
+  AIS_ACTIVE_VALUES,
+  AIS_SPECIAL_VALUES,
+  AIS_INACTIVE_VALUES,
+  ATON_STYLE_VALUES
+} from './symbol-provider';
 
 type TSqliteModule = { DatabaseSync?: unknown; Database?: unknown } | null;
 type TGetSqliteModule = () => Promise<TSqliteModule>;
@@ -90,6 +103,65 @@ const start = (server: ServerAPI): Plugin => {
         title: 'Enable Query Provider',
         description: 'The built-in History-API query provider is a feature that enables the plugin to respond to History-API requests. If you want to use another History-API provider, disable this option and configure your chosen History-API compatible provider accordingly and KIP will query that provider.',
         default: true
+      },
+      symbolProvider: {
+        type: 'object',
+        title: 'KIP as a Symbol Provider',
+        description: 'Expose KIP\'s curated AIS and Aids-to-Navigation icons to compatible chart plotters (e.g. Freeboard-SK) via the Signal K symbols resource. Selected icons override the plotter\'s built-in equivalents. All options are off by default.',
+        properties: {
+          aisSymbols: {
+            type: 'boolean',
+            title: 'Provide AIS vessel symbols',
+            description: 'Override the plotter\'s built-in AIS icons for cargo, tanker, passenger, high-speed, other, and buddy vessels, plus your own vessel, with KIP\'s equivalents.',
+            default: false
+          },
+          aisActiveSource: {
+            type: 'string',
+            title: 'Generic "active" vessel (AIS types 10–39)',
+            description: 'The plotter shows one icon for all unspecified underway vessels. Pick which KIP icon represents that group, or None to keep the plotter\'s own.',
+            enum: AIS_ACTIVE_VALUES,
+            enumNames: ['None (use plotter default)', 'Sailing', 'Pleasure Craft', 'Fishing', 'Tug / Towing', 'Military', 'Diving'],
+            default: 'none'
+          },
+          aisSpecialSource: {
+            type: 'string',
+            title: 'Generic "special craft" vessel (AIS types 50–59)',
+            description: 'The plotter shows one icon for all special-purpose craft. Pick which KIP icon represents that group, or None to keep the plotter\'s own.',
+            enum: AIS_SPECIAL_VALUES,
+            enumNames: ['None (use plotter default)', 'Pilot', 'Tug', 'Search & Rescue', 'Law Enforcement'],
+            default: 'none'
+          },
+          aisInactiveSource: {
+            type: 'string',
+            title: 'Inactive / lost vessel',
+            description: 'Icon for a stale or lost AIS target. Pick a KIP icon, or None to keep the plotter\'s own.',
+            enum: AIS_INACTIVE_VALUES,
+            enumNames: ['None (use plotter default)', 'Stationary', 'Unknown'],
+            default: 'none'
+          },
+          atonStyle: {
+            type: 'string',
+            title: 'Aids-to-Navigation symbol style',
+            description: 'Provide KIP\'s AtoN icons (cardinal, lateral, danger, safe-water, special, base station). Both forms are real aids; the plotter shows one icon per type, so choose whether they appear as floating buoys or fixed beacons.',
+            enum: ATON_STYLE_VALUES,
+            enumNames: ['None (use plotter default)', 'Floating marks (buoys)', 'Fixed beacons'],
+            default: 'none'
+          },
+          vesselScale: {
+            type: 'number',
+            title: 'AIS vessel symbol size',
+            description: 'Size multiplier for AIS vessel symbols. 1.0 matches the plotter\'s built-in size; 1.4 renders them 40% larger.',
+            default: 1.0,
+            minimum: 0.1
+          },
+          atonScale: {
+            type: 'number',
+            title: 'Aids-to-Navigation symbol size',
+            description: 'Size multiplier for AtoN symbols. 1.0 matches the plotter\'s built-in size; 1.4 renders them 40% larger.',
+            default: 1.0,
+            minimum: 0.1
+          }
+        }
       }
     }
   };
@@ -951,6 +1023,56 @@ const start = (server: ServerAPI): Plugin => {
 
     storageFlushTimer.unref?.();
   }
+  let symbolProviderConfig: SymbolProviderConfig = resolveSymbolProviderConfig(undefined);
+  let symbolProviderTimestamp = '';
+
+  /**
+   * Resolve the public base URL under which KIP's webapp assets are served.
+   * KIP ships as a single package (webapp + this plugin), so the Signal K server
+   * serves `public/assets/svg/**` at `/<package-name>/assets/svg` — outside the
+   * admin-gated `/plugins` path, reachable by read-only symbol consumers.
+   */
+  function resolveWebappAssetBase(): string {
+    try {
+      const pkg = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8')) as { name?: string };
+      if (typeof pkg.name === 'string' && pkg.name.length > 0) {
+        return `/${pkg.name}/assets/svg`;
+      }
+    } catch (error) {
+      server.debug(`[KIP][SYMBOLS] could not read package name; using default asset base: ${String((error as Error).message || error)}`);
+    }
+    return '/@mxtommy/kip/assets/svg';
+  }
+
+  function registerSymbolProvider(): void {
+    if (!symbolProviderEnabled(symbolProviderConfig)) {
+      server.debug('[KIP][SYMBOLS] provider registration skipped reason=no-categories-enabled');
+      return;
+    }
+
+    const registry = server as ServerAPI & Partial<ResourceProviderRegistry>;
+    if (typeof registry.registerResourceProvider !== 'function') {
+      server.debug('[KIP][SYMBOLS] provider registration skipped reason=api-unavailable');
+      return;
+    }
+
+    const assetBase = resolveWebappAssetBase();
+    try {
+      // Registration is idempotent (the server keys providers by plugin id), so
+      // a config change on plugin restart safely overwrites the methods. The
+      // collection is resolved lazily against the live config on every request.
+      registry.registerResourceProvider({
+        type: 'symbols',
+        methods: createSymbolProviderMethods(() =>
+          buildSymbolCollection(symbolProviderConfig, assetBase, symbolProviderTimestamp)
+        )
+      });
+      server.debug(`[KIP][SYMBOLS] provider registered assetBase=${assetBase}`);
+    } catch (error) {
+      server.error(`[KIP][SYMBOLS] provider registration failed: ${String((error as Error).message || error)}`);
+    }
+  }
+
   let modeConfig: IHistoryModeConfig | null = null;
 
   const plugin: Plugin = {
@@ -1091,6 +1213,10 @@ const start = (server: ServerAPI): Plugin => {
 
       registerHistoryProvider();
       logOperationalMode('post-provider-registration');
+
+      symbolProviderConfig = resolveSymbolProviderConfig(settings);
+      symbolProviderTimestamp = new Date().toISOString();
+      registerSymbolProvider();
 
       server.setPluginStatus(`Starting...`);
     },
